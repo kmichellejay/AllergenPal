@@ -1,93 +1,93 @@
-import openai
 import os
-from openai import OpenAI
+import openai  # Ensure OpenAI is imported
 import pandas as pd
 import requests
 from pdf2image import convert_from_path
-from io import BytesIO
-from PIL import Image
+import pytesseract
 from bs4 import BeautifulSoup
-import base64
+from langchain_openai import ChatOpenAI  # Import for text LLM
+from langchain.agents import initialize_agent, Tool
+import json
 
-# Initialize OpenAI client with environment variable for the API key
-client = openai.Client(api_key=os.environ.get("OPENAI_API_KEY"))
+# Initialize OpenAI API key
+openai.api_key = os.environ.get("OPENAI_API_KEY")
 
-# Function to convert PDF to images
-def pdf_to_images(pdf_url):
-    response = requests.get(pdf_url)
-    pdf_file = open('temp_menu.pdf', 'wb')
-    pdf_file.write(response.content)
-    pdf_file.close()
+# Initialize OpenAI LLM for text tasks
+text_llm = ChatOpenAI(model="gpt-3.5-turbo", verbose=True)  # Or any other suitable model
 
-    images = convert_from_path('temp_menu.pdf')
-    return images
+# Function to scrape the menu from a website
+def scrape_menu_from_website(url):
+    try:
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an error for bad responses
+        soup = BeautifulSoup(response.content, 'html.parser')
+        menu_items = []
 
-# Function to extract menu from an image using vision capabilities
-def extract_menu_from_image(image):
-    buffered = BytesIO()
-    image.save(buffered, format="JPEG")
-    img_b64_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    img_type = 'image/jpeg'
+        # Update the selector to match the actual structure of the menu in the HTML
+        for item in soup.select('.menu-item'):  # Adjust with the correct selector
+            name_elem = item.find('h4')
+            description_elem = item.find('p', class_='description')
+            price_elem = item.find('span', class_='price')
 
-    # Prepare your prompt for extraction
-    prompt = "Extract the menu items including name, description, and price from this image."
+            # Check if elements are found and extract text, handling any potential issues
+            name = name_elem.text.strip() if name_elem else "Unknown"
+            description = description_elem.text.strip() if description_elem else "No description"
+            price = price_elem.text.strip() if price_elem else "Price not listed"
 
-    # Call to the OpenAI API
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:{img_type};base64,{img_b64_str}"}}
-                ]
-            }
-        ],
-        max_tokens=300
-    )
+            menu_items.append({
+                'name': name,
+                'description': description,
+                'price': price
+            })
+        return pd.DataFrame(menu_items)
 
-    if response.choices and len(response.choices) > 0:
-        if hasattr(response.choices[0].message, 'content'):
-            formatted_menu = response.choices[0].message.content
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching the webpage: {e}")
+        return pd.DataFrame()  # Return empty DataFrame on error
 
-            # Attempting manual parsing
-            print("Response content:", formatted_menu)  # Log the full content for clarity
-            items = []  # To store structured menu items
+# Function to handle PDF extraction
+def extract_text_from_pdf(pdf_url):
+    try:
+        response = requests.get(pdf_url)
+        response.raise_for_status()  # Raise an error for bad responses
 
-            # Split the response into lines
-            lines = formatted_menu.strip().split('\n')
-            for line in lines:
-                line = line.strip()  # Clean leading/trailing whitespace
+        with open('temp_menu.pdf', 'wb') as pdf_file:
+            pdf_file.write(response.content)
 
-                if " - " in line:  # Assuming a typical pattern
-                    name_description = line.split(" - ", 1)
-                    if len(name_description) == 2:
-                        name = name_description[0].strip()
-                        description = name_description[1].strip()
+        # Convert PDF pages to images
+        images = convert_from_path('temp_menu.pdf')
+        extracted_text = []
 
-                        # Extract price if it appears at the end (in brackets)
-                        price = None
-                        if '(' in description and ')' in description:
-                            price_part = description.split('(')[-1].strip(')')
-                            description = description.split('(')[0].strip()  # Remove price part
-                            price = price_part.strip()
+        # Process each image with Tesseract
+        for image in images:
+            text = pytesseract.image_to_string(image)
+            extracted_text.append(text)
 
-                        items.append({'name': name, 'description': description, 'price': price})
+        # Combine extracted text from all images
+        combined_text = "\n".join(extracted_text)
 
-            # Convert the items list to a DataFrame and return
-            return pd.DataFrame(items)
+        # Further process the combined text into a DataFrame
+        menu_items = []
+        lines = combined_text.split('\n')
+        for line in lines:
+            if line.strip():  # Ignore empty lines
+                parts = line.split(" - ")  # Assume name and description are split by " - "
+                if len(parts) >= 2:
+                    name = parts[0].strip()
+                    description = parts[1].strip()
+                    menu_items.append({'name': name, 'description': description, 'price': None})  # Placeholder
 
-        else:
-            print("Error: Message object does not contain expected content.")
-            return pd.DataFrame()
-    else:
-        print("Error: No choices returned from the API response.")
-        return pd.DataFrame()
+        return pd.DataFrame(menu_items)  # Return a DataFrame
 
-# Function to check allergens with the LLM
-def check_allergens_with_llm(item_name, item_description, user_allergies):
-    # Create a prompt for the LLM to assess allergens for a specific item
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching the PDF: {e}")
+        return pd.DataFrame()  # Return empty DataFrame on error
+    except Exception as e:
+        print(f"Error processing the PDF: {e}")
+        return pd.DataFrame()  # Return empty DataFrame if any other error occurs
+
+# Tool for checking allergens
+def check_allergens(item_name, item_description, user_allergies):
     prompt = (
         f"The following food item is on the menu:\n"
         f"Name: {item_name}\n"
@@ -96,62 +96,71 @@ def check_allergens_with_llm(item_name, item_description, user_allergies):
         "does this item potentially contain any of these allergens? Please list any applicable."
     )
     
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=100
-    )
+    response = text_llm.invoke(prompt)  # Use text LLM for allergen checking
+    return response.content.strip()
+
+# Define the checking of allergens tool
+def check_allergen_tool(inputs: str) -> str:
+    # Parse the input string to extract necessary information
+    lines = inputs.split('\n')
+    item_name = ""
+    item_description = ""
+    user_allergies = []
     
-    # Extract allergen information from the response
-    if response.choices and len(response.choices) > 0:
-        return response.choices[0].message.content.strip()
+    for line in lines:
+        if line.startswith("Name:"):
+            item_name = line.split("Name:")[1].strip()
+        elif line.startswith("Description:"):
+            item_description = line.split("Description:")[1].strip()
+        elif line.startswith("Given the following allergies:"):
+            allergies_part = line.split("Given the following allergies:")[1].strip()
+            user_allergies = [allergy.strip() for allergy in allergies_part.split(',')]
 
-    return None
+    return check_allergens(item_name, item_description, user_allergies)
 
-# Updated ingredient warning function using the LLM
-def ingredient_warning_with_llm(menu_df, user_allergies):
-    warnings = []
+allergen_tool = Tool(
+    name="Check Allergens",
+    func=check_allergen_tool,
+    description="Check if an item contains allergens."
+)
 
+# Initialize tools for LangChain
+agent = initialize_agent(
+    tools=[allergen_tool],
+    llm=text_llm,
+    agent_type="chat-zero-shot-react-description",
+    verbose=True
+)
+
+def main(user_input, user_allergies):
+    items = []
+
+    if user_input.lower().endswith('.pdf'):
+        items_df = extract_text_from_pdf(user_input)
+        items.append(items_df)
+    else:
+        items_df = scrape_menu_from_website(user_input)
+        items.append(items_df)
+
+    menu_df = pd.concat(items, ignore_index=True) if items else pd.DataFrame()
+
+    warnings = {}
     for idx, row in menu_df.iterrows():
-        item_name = row['name']
-        item_description = row['description']
-        
-        allergens_found = check_allergens_with_llm(item_name, item_description, user_allergies)
+        input_prompt = (
+            f"The following food item is on the menu:\n"
+            f"Name: {row['name']}\n"
+            f"Description: {row['description']}\n"
+            f"Given the following allergies: {', '.join(user_allergies)}, "
+            f"does this item potentially contain any of these allergens? Please list any applicable."
+        )
+
+        allergens_found = agent.invoke(input_prompt)
         
         if allergens_found:
-            warnings.append(f"Warning: {item_name} may contain: {allergens_found}")
-    
-    return warnings
+            warnings[row['name']] = allergens_found.get('output', '')
 
-# Function to extract menu information from a website
-def extract_menu_from_website(website_url):
-    response = requests.get(website_url)
-    soup = BeautifulSoup(response.text, 'html.parser')
-
-    menu_dataframes = []
-    for img_tag in soup.find_all('img'):  # Adapt the extraction logic based on the actual structure of the webpage
-        img_url = img_tag['src']
-        img_response = requests.get(img_url)
-        image = Image.open(BytesIO(img_response.content))
-        menu_df = extract_menu_from_image(image)
-        menu_dataframes.append(menu_df)
-
-    return pd.concat(menu_dataframes, ignore_index=True)  # Combine DataFrames if multiple images
-
-# Main function to process input
-def main(user_input, user_allergies):
-    if user_input.lower().endswith('.pdf'):
-        images = pdf_to_images(user_input)
-        menu_df = pd.concat([extract_menu_from_image(img) for img in images], ignore_index=True)
-    else:
-        menu_df = extract_menu_from_website(user_input)
-
-    # Call the new LLM-based ingredient warning function
-    warnings = ingredient_warning_with_llm(menu_df, user_allergies)
-
-    print("\nIngredients Warnings:")
-    for warning in warnings:
-        print(warning)
+    for item, allergen_warning in warnings.items():
+        print(f"Warning: {item} may contain: {allergen_warning}")
 
 if __name__ == "__main__":
     user_allergies = ['gluten', 'tomatoes']

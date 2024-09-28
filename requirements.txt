@@ -2,7 +2,12 @@ Flask
 Flask-SQLAlchemy
 Flask-Login
 Werkzeug
-requests 
 beautifulsoup4 
 PyPDF2 
 openai
+langchain 
+pdf2image 
+Pillow 
+requests
+langchain-openai
+langchain-community
