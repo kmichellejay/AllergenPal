@@ -1,55 +1,26 @@
 import os
-import openai  # Ensure OpenAI is imported
+import openai
 import pandas as pd
 import requests
 from pdf2image import convert_from_path
 import pytesseract
 from bs4 import BeautifulSoup
-from langchain_openai import ChatOpenAI  # Import for text LLM
-from langchain.agents import initialize_agent, Tool
-import json
+from langchain_openai import ChatOpenAI
+import re
+import time
+from tenacity import retry, stop_after_attempt, wait_random_exponential
+from tqdm import tqdm
 
 # Initialize OpenAI API key
 openai.api_key = os.environ.get("OPENAI_API_KEY")
 
 # Initialize OpenAI LLM for text tasks
-text_llm = ChatOpenAI(model="gpt-3.5-turbo", verbose=True)  # Or any other suitable model
+text_llm = ChatOpenAI(model="gpt-3.5-turbo", temperature=0)
 
-# Function to scrape the menu from a website
-def scrape_menu_from_website(url):
-    try:
-        response = requests.get(url)
-        response.raise_for_status()  # Raise an error for bad responses
-        soup = BeautifulSoup(response.content, 'html.parser')
-        menu_items = []
-
-        # Update the selector to match the actual structure of the menu in the HTML
-        for item in soup.select('.menu-item'):  # Adjust with the correct selector
-            name_elem = item.find('h4')
-            description_elem = item.find('p', class_='description')
-            price_elem = item.find('span', class_='price')
-
-            # Check if elements are found and extract text, handling any potential issues
-            name = name_elem.text.strip() if name_elem else "Unknown"
-            description = description_elem.text.strip() if description_elem else "No description"
-            price = price_elem.text.strip() if price_elem else "Price not listed"
-
-            menu_items.append({
-                'name': name,
-                'description': description,
-                'price': price
-            })
-        return pd.DataFrame(menu_items)
-
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching the webpage: {e}")
-        return pd.DataFrame()  # Return empty DataFrame on error
-
-# Function to handle PDF extraction
 def extract_text_from_pdf(pdf_url):
     try:
         response = requests.get(pdf_url)
-        response.raise_for_status()  # Raise an error for bad responses
+        response.raise_for_status()
 
         with open('temp_menu.pdf', 'wb') as pdf_file:
             pdf_file.write(response.content)
@@ -66,103 +37,150 @@ def extract_text_from_pdf(pdf_url):
         # Combine extracted text from all images
         combined_text = "\n".join(extracted_text)
 
-        # Further process the combined text into a DataFrame
+        # Process the combined text into a DataFrame
         menu_items = []
         lines = combined_text.split('\n')
+        current_item = {}
         for line in lines:
-            if line.strip():  # Ignore empty lines
-                parts = line.split(" - ")  # Assume name and description are split by " - "
-                if len(parts) >= 2:
-                    name = parts[0].strip()
-                    description = parts[1].strip()
-                    menu_items.append({'name': name, 'description': description, 'price': None})  # Placeholder
+            line = line.strip()
+            if line:
+                # Check if the line is a new menu item (typically in all caps or starts with a number)
+                if line.isupper() or re.match(r'^\d+\.?\s', line):
+                    if current_item:
+                        menu_items.append(current_item)
+                    current_item = {'name': line, 'description': ''}
+                elif current_item:
+                    # Ignore prices and other non-descriptive lines
+                    if not re.match(r'^\$?\d+(\.\d{2})?$', line) and len(line) > 3:
+                        current_item['description'] += ' ' + line
 
-        return pd.DataFrame(menu_items)  # Return a DataFrame
+        if current_item:
+            menu_items.append(current_item)
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching the PDF: {e}")
-        return pd.DataFrame()  # Return empty DataFrame on error
+        return pd.DataFrame(menu_items)
+
     except Exception as e:
         print(f"Error processing the PDF: {e}")
-        return pd.DataFrame()  # Return empty DataFrame if any other error occurs
+        return pd.DataFrame()
 
-# Tool for checking allergens
-def check_allergens(item_name, item_description, user_allergies):
-    prompt = (
-        f"The following food item is on the menu:\n"
-        f"Name: {item_name}\n"
-        f"Description: {item_description}\n"
-        "Given the following allergies: " + ", ".join(user_allergies) + ", "
-        "does this item potentially contain any of these allergens? Please list any applicable."
-    )
+def scrape_menu_from_website(url):
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, 'html.parser')
+        menu_items = []
+
+        for item in soup.select('.menu-item'):
+            name_elem = item.find('h4')
+            description_elem = item.find('p', class_='description')
+            price_elem = item.find('span', class_='price')
+
+            name = name_elem.text.strip() if name_elem else "Unknown"
+            description = description_elem.text.strip() if description_elem else "No description"
+            price = price_elem.text.strip() if price_elem else "Price not listed"
+
+            menu_items.append({
+                'name': name,
+                'description': description,
+                'price': price
+            })
+        return pd.DataFrame(menu_items)
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching the webpage: {e}")
+        return pd.DataFrame()
+
+def local_allergen_check(item_name, item_description, user_allergies):
+    """Perform a local check for obvious allergens before calling the API."""
+    detected_allergens = []
+    combined_text = (item_name + " " + item_description).lower()
     
-    response = text_llm.invoke(prompt)  # Use text LLM for allergen checking
-    return response.content.strip()
-
-# Define the checking of allergens tool
-def check_allergen_tool(inputs: str) -> str:
-    # Parse the input string to extract necessary information
-    lines = inputs.split('\n')
-    item_name = ""
-    item_description = ""
-    user_allergies = []
+    allergen_keywords = {
+        'gluten': ['wheat', 'barley', 'rye', 'oats', 'flour', 'bread', 'pasta', 'cereal'],
+        'tomatoes': ['tomato', 'marinara', 'ketchup'],
+        'dairy': ['milk', 'cheese', 'cream', 'butter', 'yogurt'],
+        'nuts': ['peanut', 'almond', 'walnut', 'cashew', 'pistachio'],
+        'soy': ['soy', 'tofu', 'edamame'],
+        'fish': ['fish', 'salmon', 'tuna', 'cod', 'halibut'],
+        'shellfish': ['shrimp', 'crab', 'lobster', 'clam', 'mussel'],
+        'eggs': ['egg', 'omelette', 'frittata'],
+    }
     
-    for line in lines:
-        if line.startswith("Name:"):
-            item_name = line.split("Name:")[1].strip()
-        elif line.startswith("Description:"):
-            item_description = line.split("Description:")[1].strip()
-        elif line.startswith("Given the following allergies:"):
-            allergies_part = line.split("Given the following allergies:")[1].strip()
-            user_allergies = [allergy.strip() for allergy in allergies_part.split(',')]
+    for allergen, keywords in allergen_keywords.items():
+        if allergen in user_allergies and any(keyword in combined_text for keyword in keywords):
+            detected_allergens.append(allergen)
+    
+    return detected_allergens if detected_allergens else None
 
-    return check_allergens(item_name, item_description, user_allergies)
+@retry(wait=wait_random_exponential(min=1, max=60), stop=stop_after_attempt(6))
+def batch_check_allergens(items, user_allergies):
+    prompt = "Check the following food items for these allergens: " + ", ".join(user_allergies) + "\n\n"
+    for item in items:
+        prompt += f"Food item: {item['name']}\nDescription: {item['description']}\n\n"
+    prompt += "For each item, list only the allergens from the provided list that are likely present. If none are likely present, say 'No listed allergens detected'. Be concise and separate each item's result with '---'."
 
-allergen_tool = Tool(
-    name="Check Allergens",
-    func=check_allergen_tool,
-    description="Check if an item contains allergens."
-)
+    try:
+        response = text_llm.invoke(prompt)
+        return response.content.strip().split('---')
+    except openai.RateLimitError:
+        print("Rate limit reached. Waiting before retrying...")
+        time.sleep(20)  # Wait for 20 seconds before retrying
+        raise  # Re-raise the exception to trigger a retry
 
-# Initialize tools for LangChain
-agent = initialize_agent(
-    tools=[allergen_tool],
-    llm=text_llm,
-    agent_type="chat-zero-shot-react-description",
-    verbose=True
-)
+def process_menu(menu_df, user_allergies):
+    warnings = {}
+    items_to_check = []
+    
+    for _, row in tqdm(menu_df.iterrows(), total=len(menu_df), desc="Pre-processing menu items"):
+        name = re.sub(r'[^a-zA-Z\s]', '', row['name']).strip()
+        description = row['description'].strip()
+        
+        if not name or not description:
+            continue
+        
+        local_allergens = local_allergen_check(name, description, user_allergies)
+        if local_allergens:
+            warnings[name] = ", ".join(local_allergens)
+        else:
+            items_to_check.append({'name': name, 'description': description})
+    
+    # Process items in batches
+    batch_size = 5
+    for i in tqdm(range(0, len(items_to_check), batch_size), desc="Checking allergens with API"):
+        batch = items_to_check[i:i+batch_size]
+        try:
+            results = batch_check_allergens(batch, user_allergies)
+            for item, result in zip(batch, results):
+                if result.lower() != 'no listed allergens detected':
+                    warnings[item['name']] = result.strip()
+            time.sleep(2)  # Add a small delay between batches
+        except Exception as e:
+            print(f"Error processing batch: {e}")
+    
+    return warnings
 
-def main(user_input, user_allergies):
-    items = []
+def main():
+    user_input = input("Enter the menu URL or PDF link: ")
+    user_allergies = input("Enter allergies to check (comma-separated, e.g., gluten,tomatoes,dairy): ").split(',')
+    user_allergies = [allergen.strip().lower() for allergen in user_allergies]
 
     if user_input.lower().endswith('.pdf'):
-        items_df = extract_text_from_pdf(user_input)
-        items.append(items_df)
+        menu_df = extract_text_from_pdf(user_input)
     else:
-        items_df = scrape_menu_from_website(user_input)
-        items.append(items_df)
+        menu_df = scrape_menu_from_website(user_input)
 
-    menu_df = pd.concat(items, ignore_index=True) if items else pd.DataFrame()
+    if menu_df.empty:
+        print("Failed to extract menu information.")
+        return
 
-    warnings = {}
-    for idx, row in menu_df.iterrows():
-        input_prompt = (
-            f"The following food item is on the menu:\n"
-            f"Name: {row['name']}\n"
-            f"Description: {row['description']}\n"
-            f"Given the following allergies: {', '.join(user_allergies)}, "
-            f"does this item potentially contain any of these allergens? Please list any applicable."
-        )
+    warnings = process_menu(menu_df, user_allergies)
 
-        allergens_found = agent.invoke(input_prompt)
-        
-        if allergens_found:
-            warnings[row['name']] = allergens_found.get('output', '')
-
-    for item, allergen_warning in warnings.items():
-        print(f"Warning: {item} may contain: {allergen_warning}")
+    if warnings:
+        print("\nAllergen Warnings:")
+        for item, allergens in warnings.items():
+            print(f"- {item}: {allergens}")
+    else:
+        print("No allergen warnings for the given allergies.")
 
 if __name__ == "__main__":
-    user_allergies = ['gluten', 'tomatoes']
-    user_input = input("Enter the menu URL or PDF link: ")
-    main(user_input, user_allergies)
+    main()
