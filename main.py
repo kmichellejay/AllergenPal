@@ -151,8 +151,9 @@ def process_menu(menu_df, user_allergies):
         try:
             results = batch_check_allergens(batch, user_allergies)
             for item, result in zip(batch, results):
-                if result.lower() != 'no listed allergens detected':
-                    warnings[item['name']] = result.strip()
+                detected_allergens = [allergen.strip() for allergen in result.split(',') if allergen.strip().lower() in user_allergies]
+                if detected_allergens:
+                    warnings[item['name']] = ", ".join(detected_allergens)
             time.sleep(2)  # Add a small delay between batches
         except Exception as e:
             print(f"Error processing batch: {e}")
@@ -161,7 +162,7 @@ def process_menu(menu_df, user_allergies):
 
 def main():
     user_input = input("Enter the menu URL or PDF link: ")
-    user_allergies = input("Enter allergies to check (comma-separated, e.g., gluten,tomatoes,dairy): ").split(',')
+    user_allergies = input("Enter allergies or dietary restrictions to check (comma-separated): ").split(',')
     user_allergies = [allergen.strip().lower() for allergen in user_allergies]
 
     if user_input.lower().endswith('.pdf'):
@@ -178,9 +179,9 @@ def main():
     if warnings:
         print("\nAllergen Warnings:")
         for item, allergens in warnings.items():
-            print(f"- {item}: {allergens}")
+            print(f"{item}: {allergens}")
     else:
-        print("No allergen warnings for the given allergies.")
+        print("No allergen warnings for the given allergies or dietary restrictions.")
 
 if __name__ == "__main__":
     main()

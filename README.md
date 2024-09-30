@@ -1,7 +1,7 @@
 # AllergenPal
  Allergy friendly menu scanner
  Must have Poppler installed to run locally
- Install Homebrew and then install Popper and tesseract
+ Install Homebrew and then install Poppler and tesseract
 
  also set your openai api key in your environement first.
  Vision Agent: This will read the menu from either a PDF or a website and extract the relevant information into a structured format (e.g., a DataFrame).

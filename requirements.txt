@@ -1,7 +1,6 @@
 Flask
 Flask-SQLAlchemy
 Flask-Login
-Werkzeug
 beautifulsoup4 
 PyPDF2 
 openai
